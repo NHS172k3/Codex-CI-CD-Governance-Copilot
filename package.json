@@ -1,0 +1,37 @@
+{
+  "name": "codex-cicd-governance-copilot",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "dev": "tsx src/cli.ts",
+    "start:app": "tsx src/app-server.ts",
+    "start:mcp": "tsx src/mcp/stdio-server.ts",
+    "policy:check": "tsx src/cli.ts policy-check",
+    "policy:review": "tsx src/cli.ts policy-review",
+    "policy:explain": "tsx src/cli.ts policy-explain",
+    "governance:summary": "tsx src/cli.ts summary",
+    "demo:safe": "npm run policy:check -- --repo demo-repo --branch main --env staging --deploy \"npm run deploy:staging\" --rollback \"npm run rollback:staging\" --tests true --change-window true --changed-files \"src/service.ts\" --fail-on high --by demo-user",
+    "demo:unsafe": "npm run policy:check -- --repo demo-repo --branch feature/infra-risk --env prod --deploy \"npm run deploy:prod\" --rollback \"npm run rollback:prod\" --tests true --change-window true --changed-files \"infra/main.tf\" --fail-on high --by demo-user",
+    "demo:ai": "npm run policy:review -- --repo demo-repo --branch feature/infra-risk --env prod --deploy \"npm run deploy:prod\" --rollback \"npm run rollback:prod\" --tests true --change-window true --changed-files \"infra/main.tf\" --fail-on high --by demo-user",
+    "demo:breakglass": "npm run dev -- plan --repo demo-repo --branch feature/infra-risk --env prod --deploy \"npm run deploy:prod\" --rollback \"npm run rollback:prod\" --tests true --change-window false --changed-files \"infra/main.tf\" --break-glass true --incident-ticket \"INC-2026-001\" --by incident-commander"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.17.5",
+    "@openai/codex-sdk": "^0.107.0",
+    "dotenv": "^16.4.7",
+    "zod": "^3.24.2"
+  },
+  "devDependencies": {
+    "@types/node": "^22.13.10",
+    "tsx": "^4.19.3",
+    "typescript": "^5.8.2",
+    "vitest": "^3.0.7"
+  }
+}

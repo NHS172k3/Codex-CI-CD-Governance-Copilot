@@ -1,0 +1,218 @@
+name: Policy Gate
+
+on:
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  governance-gate:
+    runs-on: ubuntu-latest
+    env:
+      POLICY_FAIL_ON: high
+    permissions:
+      contents: read
+      pull-requests: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Unit tests
+        run: npm test
+
+      - name: Collect changed files
+        id: changed_files
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const files = await github.paginate(github.rest.pulls.listFiles, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.payload.pull_request.number,
+              per_page: 100
+            });
+            const names = files.map((f) => f.filename);
+            const csv = names.join(',');
+            core.setOutput('files_csv', csv);
+            core.info(`Changed files count: ${names.length}`);
+
+      - name: Default changed files for non-PR events
+        id: changed_files_default
+        if: github.event_name != 'pull_request'
+        shell: bash
+        run: echo "files_csv=" >> "$GITHUB_OUTPUT"
+
+      - name: Codex policy review
+        id: policy_review
+        continue-on-error: true
+        shell: bash
+        env:
+          CODEX_API_KEY: ${{ secrets.CODEX_API_KEY || secrets.OPENAI_API_KEY }}
+          CODEX_MODEL: gpt-5.3-codex
+        run: >-
+          npm run policy:review --
+          --repo "${{ github.repository }}"
+          --branch "${{ github.base_ref || github.ref_name }}"
+          --env "staging"
+          --deploy "npm run deploy:staging"
+          --rollback "npm run rollback:staging"
+          --tests true
+          --change-window true
+          --changed-files "${{ steps.changed_files.outputs.files_csv || steps.changed_files_default.outputs.files_csv }}"
+          --fail-on "${{ env.POLICY_FAIL_ON }}"
+          --by "github-actions" > review-result.json;
+          echo "exit_code=$?" >> "$GITHUB_OUTPUT"
+
+      - name: Ensure review result file exists
+        if: always()
+        shell: bash
+        run: |
+          if [ ! -f review-result.json ]; then
+            echo '{"passed":false,"finalDecision":"block","failOn":"high","policyPassed":false,"highestSeverity":"high","violations":[{"code":"REVIEW_STEP_ERROR","message":"Review step did not produce JSON output.","severity":"high"}],"evaluatedAt":"unknown","codex":{"source":"fallback","model":"gpt-5.3-codex","recommendedDecision":"block","narrative":"Codex review unavailable.","checklist":["Review policy violations","Validate rollback readiness","Capture explicit human approval"],"error":"Review step did not produce JSON output."}}' > review-result.json
+          fi
+
+      - name: Post PR governance comment
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('node:fs');
+            const marker = '<!-- codex-governance-policy-comment -->';
+            const path = 'review-result.json';
+            let review;
+            try {
+              review = JSON.parse(fs.readFileSync(path, 'utf8'));
+            } catch (error) {
+              review = {
+                passed: false,
+                finalDecision: 'block',
+                failOn: 'high',
+                policyPassed: false,
+                highestSeverity: 'high',
+                violations: [
+                  {
+                    code: 'REVIEW_PARSE_ERROR',
+                    message: `Could not parse ${path}: ${error.message}`,
+                    severity: 'high'
+                  }
+                ],
+                evaluatedAt: 'unknown',
+                codex: {
+                  source: 'fallback',
+                  model: 'gpt-5.3-codex',
+                  recommendedDecision: 'block',
+                  narrative: `Could not parse ${path}: ${error.message}`,
+                  checklist: [
+                    'Review policy violations',
+                    'Validate rollback readiness',
+                    'Capture explicit approval decision'
+                  ]
+                }
+              };
+            }
+
+            const explanation = review.codex ?? {
+                source: 'fallback',
+                model: 'gpt-5.3-codex',
+                recommendedDecision: 'block',
+                narrative: 'Codex output unavailable.',
+                checklist: [
+                  'Review policy violations',
+                  'Validate rollback readiness',
+                  'Capture explicit approval decision'
+                ],
+              };
+
+            const statusEmoji = review.passed ? '✅' : '❌';
+            const statusText = review.passed ? 'PASSED' : 'FAILED';
+            const failOn = review.failOn ?? 'high';
+            const policyPassed = review.policyPassed === true;
+            const highestSeverity = review.highestSeverity ?? 'none';
+            const finalDecision = review.finalDecision ?? 'block';
+            const violations = Array.isArray(review.violations) ? review.violations : [];
+            const explanationChecklist = Array.isArray(explanation.checklist) ? explanation.checklist : [];
+            const violationLines = violations.length
+              ? violations.map((v, i) => `${i + 1}. [${v.severity}] ${v.code} — ${v.message}`).join('\n')
+              : 'No violations.';
+            const checklistLines = explanationChecklist.length
+              ? explanationChecklist.map((item, i) => `${i + 1}. ${item}`).join('\n')
+              : 'No additional checklist provided.';
+
+            const body = [
+              marker,
+              '## Codex Governance Policy Gate',
+              '',
+              `${statusEmoji} **Status:** ${statusText}`,
+              `- Final decision: ${finalDecision}`,
+              `- Gate threshold (fail-on): ${failOn}`,
+              `- Highest violation severity: ${highestSeverity}`,
+              `- Raw policy pass (no violations): ${policyPassed ? 'yes' : 'no'}`,
+              `- Evaluated at: ${review.evaluatedAt ?? 'unknown'}`,
+              `- Workflow: ${context.workflow}`,
+              `- Commit: ${context.sha}`,
+              '',
+              '### Violations',
+              violationLines,
+              '',
+              '### Codex Risk Narrative',
+              `- Source: ${explanation.source ?? 'fallback'}`,
+              `- Model: ${explanation.model ?? 'gpt-5.3-codex'}`,
+              `- Recommended decision: ${explanation.recommendedDecision ?? 'block'}`,
+              explanation.narrative ?? 'No narrative provided.',
+              '',
+              '### Codex Checklist',
+              checklistLines,
+              '',
+              '### Required Approver Checklist',
+              '- [ ] I reviewed policy output and associated risk',
+              '- [ ] I confirmed rollback command exists and is valid',
+              '- [ ] I confirmed test and change-window requirements',
+              '- [ ] I accept deployment accountability for this change'
+            ].join('\n');
+
+            const issue_number = context.payload.pull_request.number;
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number,
+              per_page: 100
+            });
+
+            const existing = comments.find((c) => c.body && c.body.includes(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number,
+                body
+              });
+            }
+
+      - name: Fail workflow on policy violation
+        if: steps.policy_review.outputs.exit_code != '0'
+        shell: bash
+        run: |
+          echo "Codex policy review failed. See PR comment for details."
+          exit 1
